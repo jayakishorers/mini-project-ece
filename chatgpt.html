@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ESP32 DSP Visualizer — Light</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
+    :root{
+      --bg: #f7fafc;
+      --card: #ffffff;
+      --muted: #64748b;
+      --accent: #2563eb;
+      --glass: rgba(2,6,23,0.03);
+      --text: #0b1220;
+    }
+    body {
+      font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+      background: var(--bg);
+      color: var(--text);
+      -webkit-font-smoothing:antialiased;
+      -moz-osx-font-smoothing:grayscale;
+    }
+    .glass {
+      background: var(--card);
+      border: 1px solid rgba(11,18,32,0.06);
+      border-radius: 12px;
+      padding: 14px;
+      box-shadow: 0 6px 18px rgba(15,23,42,0.06);
+    }
+    canvas { width:100%; height:100%; display:block; background: transparent; }
+    .small { font-size:0.86rem; color:var(--muted); }
+    .muted { color:var(--muted); }
+    .badge { background:linear-gradient(90deg,var(--accent),#8b5cf6); padding:8px 12px; border-radius:999px; color:white; font-weight:700; }
+    header .title { font-weight:700; font-size:1.25rem; display:flex; gap:8px; align-items:center;}
+    .navSections { display:flex; gap:8px; flex-wrap:wrap; }
+    .navBtn { background:transparent; border:1px solid rgba(11,18,32,0.06); padding:8px 10px; border-radius:8px; cursor:pointer; color:var(--muted); }
+    .navBtn.active { background:linear-gradient(90deg,#eef2ff,#fff); border-color:rgba(37,99,235,0.12); color:var(--accent); box-shadow:0 4px 10px rgba(37,99,235,0.06); }
+    .sections { display:flex; flex-direction:column; gap:18px; margin-top:10px; }
+    .section { scroll-margin-top:70px; transition:all .18s ease; }
+    .sectionHeader { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:10px; }
+    .canvasWrap { height:260px; border-radius:10px; overflow:hidden; background:#fff; border:1px solid rgba(11,18,32,0.04); }
+    .section.expanded .canvasWrap { height:520px; } /* expanded view */
+    .overallLegend { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    .legendItem { display:flex; gap:6px; align-items:center; font-size:0.9rem; color:var(--muted); cursor:pointer; user-select:none; }
+    .legendSwatch { width:12px; height:8px; border-radius:2px; }
+    .smallNote { font-size:0.82rem; color:var(--muted); }
+    footer { margin-top:18px; color:var(--muted); font-size:0.9rem; }
+    @media (max-width:900px) {
+      .section.expanded .canvasWrap { height:380px; }
+    }
+  </style>
+</head>
+<body class="p-6">
+  <div class="max-w-6xl mx-auto">
+    <header class="flex items-center justify-between mb-4">
+      <div>
+        <div class="title">
+          <div>📡</div>
+          <div>
+            <div>ESP32 DSP Visualizer — Light</div>
+            <div class="small muted">Large sections · 8s history · real-time overall summary</div>
+          </div>
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
+        <input id="ipInput" class="glass px-3 py-2" placeholder="ESP32 IP (e.g. 10.98.109.134)" />
+        <button id="connectBtn" class="badge">Connect</button>
+      </div>
+    </header>
+
+    <section class="glass p-3 mb-4">
+      <div class="flex items-center justify-between">
+        <div>
+          Status: <span id="statusText" class="muted">idle</span>
+          <span class="small ml-3 muted">Mode:</span>
+          <select id="modeSelect" class="glass px-2 py-1 small">
+            <option value="auto">Auto-detect</option>
+            <option value="json">JSON text</option>
+            <option value="binary">Binary</option>
+          </select>
+        </div>
+        <div class="navSections" id="navSections"></div>
+      </div>
+      <div class="smallNote mt-2">Click a section in the top nav to focus / expand. Overall shows aggregated RMS/Peak/Centroid over last 8 seconds.</div>
+    </section>
+
+    <div class="sections" id="sectionsContainer">
+      <!-- Sections will be injected by JS -->
+    </div>
+
+    <footer class="small muted">Tip: use ESP32 serial IP and port 81 (ws://IP:81). The client accepts JSON {"data":[...], "rms":..., "pcm":[...]}. If you want waveform/ZCR, have ESP32 include "pcm".</footer>
+  </div>
+
+<script>
+/* ------- Configuration ------- */
+const SAMPLE_RATE = 16000;
+const NYQUIST = SAMPLE_RATE / 2;
+const HISTORY_WINDOW_MS = 8000; // 8 seconds
+const SECTION_KEYS = [
+  { id: 'spectrum', title: 'Spectrum' },
+  { id: 'spectrogram', title: 'Spectrogram' },
+  { id: 'waveform', title: 'Waveform' },
+  { id: 'octave', title: 'Octave Bands' },
+  { id: 'rms', title: 'RMS Meter' },
+  { id: 'peak', title: 'Peak Frequency' },
+  { id: 'centroid', title: 'Spectral Centroid' },
+  { id: 'flux', title: 'Spectral Flux' },
+  { id: 'zcr', title: 'Zero Crossing Rate' },   // ✅ NEW LINE
+  { id: 'hist', title: 'Low/Mid/High' },
+  { id: 'overall', title: 'Overall Summary' }
+];
+
+/* ------- UI scaffolding ------- */
+const navContainer = document.getElementById('navSections');
+const sectionsContainer = document.getElementById('sectionsContainer');
+const statusText = document.getElementById('statusText');
+const ipInput = document.getElementById('ipInput');
+const connectBtn = document.getElementById('connectBtn');
+const modeSelect = document.getElementById('modeSelect');
+
+let activeSection = 'spectrum';
+let ws = null;
+
+/* Build top-nav and large section containers */
+SECTION_KEYS.forEach((s, i) => {
+  const btn = document.createElement('button');
+  btn.className = 'navBtn' + (i===0 ? ' active' : '');
+  btn.textContent = s.title;
+  btn.onclick = () => activateSection(s.id);
+  navContainer.appendChild(btn);
+
+  const sec = document.createElement('div');
+  sec.className = 'section' + (i===0 ? ' expanded' : '');
+  sec.id = 'sec-' + s.id;
+  sec.innerHTML = `
+    <div class="sectionHeader">
+      <div><strong>${s.title}</strong> <div class="small muted">${i+1}/10</div></div>
+      <div class="small muted" id="${s.id}-meta"></div>
+    </div>
+    <div class="canvasWrap glass p-2">
+      <canvas id="${s.id}Canvas"></canvas>
+    </div>
+  `;
+  sectionsContainer.appendChild(sec);
+});
+
+/* Activate/expand a section */
+function activateSection(id) {
+  activeSection = id;
+  // update nav buttons
+  Array.from(navContainer.children).forEach((b, idx) => {
+    b.classList.toggle('active', SECTION_KEYS[idx].id === id);
+  });
+  // update sections
+  SECTION_KEYS.forEach(s => {
+    const el = document.getElementById('sec-' + s.id);
+    el.classList.toggle('expanded', s.id === id);
+    if (s.id === id) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  });
+}
+
+/* ------- Canvas contexts ------- */
+const ctxs = {};
+SECTION_KEYS.forEach(s => {
+  const c = document.getElementById(s.id + 'Canvas');
+  ctxs[s.id] = c.getContext('2d');
+});
+
+/* Responsive canvas sizing */
+function fitCanvas(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.max(2, Math.floor(rect.width * dpr));
+  canvas.height = Math.max(2, Math.floor(rect.height * dpr));
+}
+window.addEventListener('resize', ()=>{ /* nothing */ });
+
+/* ------- Data buffers (time-stamped) ------- */
+let freqData = new Float32Array(0);
+let pcmData = null;
+let lastFrameTs = 0;
+let specHistory = []; // array of {ts, frame[]}
+let metricsHistory = []; // array of {ts, rms, peakFreq, centroid}
+
+/* Helpers */
+function nowMs(){ return Date.now(); }
+function frequencyFromBin(binIndex, bins){ return Math.round((binIndex * NYQUIST) / bins); }
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+
+/* ------- WebSocket + parsing ------- */
+connectBtn.addEventListener('click', ()=>{
+  if (ws && ws.readyState === WebSocket.OPEN) { ws.close(); return; }
+  const ip = ipInput.value.trim();
+  if (!ip) { alert('Enter ESP32 IP from serial (e.g. 10.98.109.134)'); return; }
+  const url = `ws://${ip}:81`;
+  statusText.textContent = 'connecting...';
+  try {
+    ws = new WebSocket(url);
+  } catch(e) { statusText.textContent = 'ws construction failed'; console.error(e); return; }
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = ()=>{ statusText.textContent = 'connected'; connectBtn.textContent = 'Disconnect'; };
+  ws.onclose = ()=>{ statusText.textContent = 'disconnected'; connectBtn.textContent = 'Connect'; };
+  ws.onerror = (ev)=>{ statusText.textContent = 'error'; console.error(ev); };
+  ws.onmessage = handleMessage;
+});
+
+/* parse messages — accept JSON with "data" or "pcm" or status messages */
+function handleMessage(ev) {
+  if (ev.data instanceof ArrayBuffer) return parseArrayBuffer(ev.data);
+  if (ev.data instanceof Blob) { ev.data.text().then(t=>parseTextMessage(t)); return; }
+  if (typeof ev.data === 'string') parseTextMessage(ev.data);
+}
+
+function parseTextMessage(text) {
+  try {
+    const obj = JSON.parse(text);
+    if (obj.status) {
+      // show status small text
+      statusText.textContent = obj.status;
+      return;
+    }
+    if (obj.data || obj.pcm || obj.rms_raw || obj.rms_norm) {
+      // main structured payload
+      if (obj.data) {
+        const arr = Array.isArray(obj.data) ? obj.data : [];
+        freqData = new Float32Array(arr.length);
+        for (let i=0;i<arr.length;i++) freqData[i] = Number(arr[i]) || 0;
+      }
+      if (obj.pcm) {
+        const p = Array.isArray(obj.pcm) ? obj.pcm : [];
+        pcmData = new Float32Array(p.length);
+        for (let i=0;i<p.length;i++) pcmData[i] = Number(p[i]) || 0;
+      }
+      // compute metrics and push history
+      ingestFrame(obj);
+    }
+  } catch(e) { console.warn('JSON parse failed', e); }
+}
+
+function parseArrayBuffer(buf) {
+  const byteLen = buf.byteLength;
+  // try float32
+  if (byteLen % 4 === 0) {
+    const f32 = new Float32Array(buf);
+    freqData = new Float32Array(f32.length);
+    for (let i=0;i<f32.length;i++) freqData[i] = f32[i];
+    ingestFrame({});
+    return;
+  }
+  // try int16 PCM
+  if (byteLen % 2 === 0) {
+    const i16 = new Int16Array(buf);
+    pcmData = new Float32Array(i16.length);
+    for (let i=0;i<i16.length;i++) pcmData[i] = i16[i]/32768;
+    ingestFrame({});
+    return;
+  }
+  console.warn('ArrayBuffer format not recognized, bytes:', byteLen);
+}
+
+/* Compute RMS/peak/centroid and store timestamped frame (keeps last 8s) */
+function ingestFrame(obj) {
+  const ts = nowMs();
+  lastFrameTs = ts;
+
+  // Compute rmsEstimate (prefer obj.rms_norm or obj.rms_raw if present)
+  let rms = 0;
+  if (obj.rms_norm) rms = Number(obj.rms_norm);
+  else if (obj.rms_raw) { // raw amplitude -> normalize
+    const full = 32768.0;
+    rms = Number(obj.rms_raw)/full;
+  } else if (pcmData && pcmData.length>0) {
+    let s=0; for (let i=0;i<pcmData.length;i++){ s += pcmData[i]*pcmData[i]; }
+    rms = Math.sqrt(s/(pcmData.length||1));
+  } else if (freqData && freqData.length>0) {
+    // approximate from magnitude bins (not perfect but ok)
+    let s=0; for (let i=0;i<freqData.length;i++){ s += freqData[i]*freqData[i]; }
+    rms = Math.sqrt(s/(freqData.length||1))/ (Math.max(...freqData)||1);
+  }
+
+  // Peak frequency from freqData
+  let peakFreq = 0;
+  if (obj.peakFreq) peakFreq = Number(obj.peakFreq);
+  else if (freqData && freqData.length>0) {
+    let maxV=-Infinity, idx=0;
+    for (let i=0;i<freqData.length;i++){ if (freqData[i]>maxV){ maxV=freqData[i]; idx=i; } }
+    peakFreq = frequencyFromBin(idx, freqData.length);
+  }
+
+  // Spectral centroid
+  let centroid = 0;
+  if (obj.centroid) centroid = Number(obj.centroid);
+  else if (freqData && freqData.length>0) {
+    let num=0,den=0;
+    for (let i=0;i<freqData.length;i++){
+      const f = (i * NYQUIST) / freqData.length;
+      num += f * freqData[i];
+      den += freqData[i];
+    }
+    centroid = den>0 ? num/den : 0;
+  }
+
+  // Save spectrogram frame (if freqData exists)
+  if (freqData && freqData.length>0) {
+    // store a normalized frame (clamped)
+    const frame = Array.from(freqData).map(v=> (isFinite(v) ? v : 0) );
+    specHistory.push({ts, frame});
+  }
+
+  // Save metrics
+  // ✅ Compute Zero Crossing Rate
+let zcr = 0;
+if (pcmData && pcmData.length > 1) {
+  let crossings = 0;
+  for (let i = 1; i < pcmData.length; i++) {
+    if ((pcmData[i - 1] >= 0 && pcmData[i] < 0) || (pcmData[i - 1] < 0 && pcmData[i] >= 0)) {
+      crossings++;
+    }
+  }
+  zcr = crossings / pcmData.length;
+}
+
+// ✅ Add zcr to metrics history
+metricsHistory.push({ ts, rms, peakFreq, centroid, zcr });
+
+  pruneOldHistory();
+}
+
+/* Remove older than HISTORY_WINDOW_MS */
+function pruneOldHistory() {
+  const cutoff = nowMs() - HISTORY_WINDOW_MS;
+  while (specHistory.length && specHistory[0].ts < cutoff) specHistory.shift();
+  while (metricsHistory.length && metricsHistory[0].ts < cutoff) metricsHistory.shift();
+}
+
+/* ------- Drawing loop ------- */
+function draw() {
+  requestAnimationFrame(draw);
+  drawSpectrum();
+  drawSpectrogram();
+  drawWaveform();
+  drawOctave();
+  drawRMS();
+  drawPeak();
+  drawCentroid();
+  drawFlux();
+  drawZCR(); 
+  drawHistogram();
+  drawOverall(); // summary chart
+}
+draw();
+
+/* Utility: choose a color for line */
+function colorFor(key){
+  if (key==='rms') return '#10b981';
+  if (key==='peak') return '#2563eb';
+  if (key==='centroid') return '#fb923c';
+  return '#888';
+}
+
+/* Drawing functions (kept intentionally simple and performant) */
+
+function drawSpectrum() {
+  const canvas = document.getElementById('spectrumCanvas');
+  fitCanvas(canvas);
+  const ctx = ctxs.spectrum;
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0,0,w,h);
+
+  const meta = document.getElementById('spectrum-meta');
+  if (!freqData || freqData.length===0) { 
+    ctx.fillStyle = '#94a3b8'; ctx.font = (14*(window.devicePixelRatio||1))+'px Inter';
+    ctx.fillText('Waiting for spectrum data...', 12, 28);
+    meta.textContent = '';
+    return;
+  }
+  const bins = freqData.length;
+  const barW = w / bins;
+  let maxMag = Math.max(...freqData);
+  if (!isFinite(maxMag) || maxMag <= 0) maxMag = 1;
+
+  let peakVal=-Infinity, peakIdx=0;
+  for (let i=0;i<bins;i++){
+    const v = freqData[i]/maxMag;
+    const barH = v*(h-20);
+    const x = i*barW;
+    ctx.fillStyle = `hsl(${(i/bins)*220},70%,45%)`;
+    ctx.fillRect(x, h-barH, barW*0.9, barH);
+    if (freqData[i]> peakVal){ peakVal=freqData[i]; peakIdx=i; }
+  }
+  const peakFreq = Math.round(frequencyFromBin(peakIdx, bins));
+  meta.textContent = `Bins: ${bins} · Peak: ${peakFreq}Hz`;
+}
+
+function drawSpectrogram() {
+  const canvas = document.getElementById('spectrogramCanvas');
+  fitCanvas(canvas);
+  const ctx = ctxs.spectrogram;
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0,0,w,h);
+
+  if (specHistory.length===0) {
+    ctx.fillStyle = '#94a3b8'; ctx.font = (14*(window.devicePixelRatio||1))+'px Inter';
+    ctx.fillText('Waiting for spectrogram...', 12, 28);
+    document.getElementById('spectrogram-meta').textContent = '';
+    return;
+  }
+
+  // Use frames from specHistory (already pruned to last 8s)
+  const history = specHistory.slice(); // copy
+  const frames = history.length;
+  const bins = history[0].frame.length;
+  const colW = Math.max(1, Math.floor(w / Math.max(frames,1)));
+  for (let x=0; x<frames; x++){
+    const frame = history[x].frame;
+    const maxF = Math.max(...frame) || 1;
+    for (let b=0; b<bins; b++){
+      const v = (frame[b] / maxF);
+      const lum = 90 - Math.round(v*70);
+      ctx.fillStyle = `hsl(${220 - Math.round(v*220)}, 60%, ${lum}%)`;
+      const y = Math.floor(h - (b/bins)*h);
+      ctx.fillRect(x*colW, y-colW, colW, Math.max(1, Math.ceil(h/bins)));
+    }
+  }
+  document.getElementById('spectrogram-meta').textContent = `History: ${Math.round(HISTORY_WINDOW_MS/1000)}s · Frames: ${frames}`;
+}
+
+function drawWaveform() {
+  const canvas = document.getElementById('waveformCanvas');
+  fitCanvas(canvas);
+  const ctx = ctxs.waveform;
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0,0,w,h);
+
+  const meta = document.getElementById('waveform-meta');
+  if (!pcmData || pcmData.length===0){ 
+    ctx.strokeStyle = '#94a3b8'; ctx.beginPath(); ctx.moveTo(0,h/2); ctx.lineTo(w,h/2); ctx.stroke();
+    meta.textContent = 'PCM not provided';
+    return;
+  }
+  const len = pcmData.length;
+  const step = Math.max(1, Math.floor(len / w));
+  ctx.lineWidth = 1.2 * (window.devicePixelRatio||1);
+  ctx.strokeStyle = '#0ea5a4';
+  ctx.beginPath();
+  for (let x=0, i=0; x<w && i<len; x++, i+=step){
+    const s = clamp(pcmData[i], -1, 1);
+    const y = (1 - (s*0.9+0.5))*h;
+    if (x===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+  meta.textContent = `Samples: ${len}`;
+}
+
+function drawOctave(){
+  const canvas = document.getElementById('octaveCanvas');
+  fitCanvas(canvas);
+  const ctx = ctxs.octave;
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0,0,w,h);
+
+  const meta = document.getElementById('octave-meta');
+  if (!freqData || freqData.length===0){ ctx.fillStyle='#94a3b8'; ctx.fillText('No data',12,28); meta.textContent=''; return; }
+  const bands = 8;
+  const bins = freqData.length;
+  const groupSize = Math.max(1, Math.floor(bins / bands));
+  const mags = [];
+  for (let b=0;b<bands;b++){
+    let sum=0; const start=b*groupSize; const end=Math.min(start+groupSize, bins);
+    for (let i=start;i<end;i++) sum += freqData[i];
+    mags.push(sum/(end-start||1));
+  }
+  const maxVal = Math.max(...mags)||1;
+  for (let b=0;b<bands;b++){
+    const val = mags[b]/maxVal;
+    const x = Math.round(b*(w/bands));
+    const bw = Math.round(w/bands - 12);
+    const bh = Math.round(val*(h-40));
+    ctx.fillStyle = `hsl(${b*(360/bands)},70%,45%)`;
+    ctx.fillRect(x+8, h-30-bh, bw, bh);
+    ctx.fillStyle = '#0b1220'; ctx.font = (12*(window.devicePixelRatio||1))+'px Inter';
+    ctx.textAlign = 'center';
+    ctx.fillText('B'+(b+1), x+8 + bw/2, h-8);
+  }
+  meta.textContent = `8 bands`;
+}
+
+function drawRMS(){
+  const canvas = document.getElementById('rmsCanvas');
+  fitCanvas(canvas);
+  const ctx = ctxs.rms;
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0,0,w,h);
+
+  // compute last RMS from metricsHistory
+  const meta = document.getElementById('rms-meta');
+  if (metricsHistory.length===0){ ctx.fillStyle='#94a3b8'; ctx.fillText('No RMS yet',12,28); meta.textContent=''; return; }
+  const last = metricsHistory[metricsHistory.length-1];
+  const pct = clamp(last.rms*100, 0, 100);
+  // draw bar
+  ctx.fillStyle = '#e6fdf5'; ctx.fillRect(10, h/3, w-20, h/3);
+  ctx.fillStyle = '#10b981';
+  ctx.fillRect(10, h/3, (w-20)*(pct/100), h/3);
+  ctx.fillStyle = '#0b1220'; ctx.font = (14*(window.devicePixelRatio||1))+'px Inter';
+  ctx.fillText(`RMS: ${last.rms.toFixed(4)} (${(pct).toFixed(1)}%)`, 16, h/2 - 10);
+  meta.textContent = `dB (approx): ${ last.rms>0 ? (20*Math.log10(last.rms)).toFixed(1) : '-∞' }`;
+}
+
+function drawPeak(){
+  const canvas = document.getElementById('peakCanvas');
+  fitCanvas(canvas);
+  const ctx = ctxs.peak;
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0,0,w,h);
+  const meta = document.getElementById('peak-meta');
+  if (metricsHistory.length===0){ ctx.fillStyle='#94a3b8'; ctx.fillText('No Peak',12,28); meta.textContent=''; return; }
+  const last = metricsHistory[metricsHistory.length-1];
+  ctx.fillStyle = '#2563eb'; ctx.font = (36*(window.devicePixelRatio||1))+'px Inter';
+  ctx.fillText(`${Math.round(last.peakFreq)} Hz`, 12, h/2 + 12);
+  meta.textContent = `Peak measured from spectrum`;
+}
+
+function drawCentroid(){
+  const canvas = document.getElementById('centroidCanvas');
+  fitCanvas(canvas);
+  const ctx = ctxs.centroid;
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0,0,w,h);
+  const meta = document.getElementById('centroid-meta');
+  if (metricsHistory.length===0){ ctx.fillStyle='#94a3b8'; ctx.fillText('No Centroid',12,28); meta.textContent=''; return; }
+  const last = metricsHistory[metricsHistory.length-1];
+  ctx.fillStyle = '#fb923c'; ctx.font = (24*(window.devicePixelRatio||1))+'px Inter';
+  ctx.fillText(`${Math.round(last.centroid)} Hz`, 12, h/2 + 8);
+  meta.textContent = `Spectral centroid indicates brightness`;
+}
+
+function drawFlux(){
+  const canvas = document.getElementById('fluxCanvas');
+  fitCanvas(canvas);
+  const ctx = ctxs.flux;
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0,0,w,h);
+  if (!freqData || freqData.length===0){ ctx.fillStyle='#94a3b8'; ctx.fillText('No flux',12,28); document.getElementById('flux-meta').textContent=''; return; }
+  if (!window.prevSpec) window.prevSpec = Array.from(freqData);
+  let sum=0;
+  for (let i=0;i<freqData.length;i++){
+    const d = freqData[i] - (window.prevSpec[i]||0);
+    sum += (d>0)? d*d : 0;
+  }
+  const flux = Math.sqrt(sum);
+  window.prevSpec = Array.from(freqData);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0,0,w,h);
+  ctx.fillStyle = '#fb7185';
+  const valW = Math.min(w, Math.round((flux/(Math.max(...freqData)||1))*w*2));
+  ctx.fillRect(10, h/2-12, valW, 24);
+  document.getElementById('flux-meta').textContent = `Flux: ${flux.toFixed(3)}`;
+}
+
+function drawHistogram(){
+  const canvas = document.getElementById('histCanvas');
+  fitCanvas(canvas);
+  const ctx = ctxs.hist;
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0,0,w,h);
+  if (!freqData || freqData.length===0){ ctx.fillStyle='#94a3b8'; ctx.fillText('No data',12,28); document.getElementById('hist-meta').textContent=''; return; }
+  const bins = freqData.length;
+  const binHz = NYQUIST / bins;
+  const lowEndHz = 250, midEndHz = 4000;
+  const lowBin = Math.floor(lowEndHz / binHz);
+  const midBin = Math.floor(midEndHz / binHz);
+  let lowSum=0, midSum=0, highSum=0;
+  for (let i=0;i<bins;i++){
+    if (i < lowBin) lowSum += freqData[i];
+    else if (i < midBin) midSum += freqData[i];
+    else highSum += freqData[i];
+  }
+  lowSum /= Math.max(1, lowBin); midSum /= Math.max(1, midBin-lowBin); highSum /= Math.max(1, bins-midBin);
+  const arr = [lowSum, midSum, highSum];
+  const labels = ['Low (20-250)', 'Mid (250-4k)', 'High (4k-8k)'];
+  const colors = ['#ef4444','#f59e0b','#3b82f6'];
+  const maxVal = Math.max(...arr) || 1;
+  const bw = Math.floor(w/3)-24;
+  for (let i=0;i<3;i++){
+    const val = arr[i]/maxVal;
+    const x = i*(w/3) + 24;
+    const barH = Math.round(val*(h-80));
+    ctx.fillStyle = colors[i];
+    ctx.fillRect(x, h-40-barH, bw, barH);
+    ctx.fillStyle = '#0b1220'; ctx.font = (12*(window.devicePixelRatio||1))+'px Inter'; ctx.textAlign='center';
+    ctx.fillText(labels[i], x + bw/2, h-10);
+  }
+  document.getElementById('hist-meta').textContent = `Low/Mid/High`;
+}
+
+/* -------- Overall summary chart (time-series last 8s) ------- */
+let overallVisible = { rms: true, peak: true, centroid: true };
+
+function drawOverall(){
+  const canvas = document.getElementById('overallCanvas');
+  fitCanvas(canvas);
+  const ctx = ctxs.overall;
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0,0,w,h);
+
+  // meta
+  const metaEl = document.getElementById('overall-meta');
+  metaEl.textContent = `Window: ${HISTORY_WINDOW_MS/1000}s · Samples: ${metricsHistory.length}`;
+
+  if (metricsHistory.length===0){
+    ctx.fillStyle='#94a3b8'; ctx.fillText('No data yet',12,28); return;
+  }
+
+  // compute timescale and mapping
+  const cutoff = nowMs() - HISTORY_WINDOW_MS;
+  const data = metricsHistory.filter(d=>d.ts >= cutoff);
+  if (data.length===0){ ctx.fillStyle='#94a3b8'; ctx.fillText('No recent data',12,28); return; }
+
+  const minT = data[0].ts, maxT = data[data.length-1].ts;
+  const pad = 36;
+  const plotW = w - pad*2, plotH = h - 48;
+
+  // find ranges
+  const rmsMax = Math.max(...data.map(d=>d.rms)) || 1e-6;
+  const peakMax = Math.max(...data.map(d=>d.peakFreq)) || 1;
+  const centroidMax = Math.max(...data.map(d=>d.centroid)) || 1;
+
+  // draw grid
+  ctx.strokeStyle = 'rgba(11,18,32,0.06)';
+  ctx.lineWidth = 1;
+  for (let gy=0; gy<5; gy++){
+    ctx.beginPath();
+    const y = pad + (plotH/4)*gy;
+    ctx.moveTo(pad, y); ctx.lineTo(pad+plotW, y); ctx.stroke();
+  }
+
+  // helper to map t->x
+  const ttoX = t => pad + ((t - minT) / (maxT - minT || 1)) * plotW;
+
+  // draw lines for each metric if visible
+  function drawLine(key, scaleMax, mapVal, strokeStyle){
+    if (!overallVisible[key]) return;
+    ctx.beginPath();
+    ctx.lineWidth = 2.2;
+    ctx.strokeStyle = strokeStyle;
+    for (let i=0;i<data.length;i++){
+      const d = data[i];
+      const x = ttoX(d.ts);
+      const v = mapVal(d);
+      const y = pad + plotH - (v/scaleMax) * plotH;
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+  }
+
+  drawLine('rms', rmsMax, d => d.rms, colorFor('rms'));
+  drawLine('peak', peakMax, d => d.peakFreq, colorFor('peak'));
+  drawLine('centroid', centroidMax, d => d.centroid, colorFor('centroid'));
+
+  // legend visuals
+  const legendX = pad; const legendY = 12;
+  const legendGap = 110;
+  let lx = legendX;
+  [['rms','RMS',colorFor('rms')], ['peak','Peak Hz',colorFor('peak')], ['centroid','Centroid Hz',colorFor('centroid')]].forEach(([k,label,col])=>{
+    ctx.fillStyle = col; ctx.fillRect(lx, legendY-8, 12, 8);
+    ctx.fillStyle = '#0b1220'; ctx.font = (12*(window.devicePixelRatio||1))+'px Inter';
+    ctx.fillText(label, lx+18, legendY);
+    lx += legendGap;
+  });
+}
+
+/* ------- Prepare small metas and contexts references ------- */
+SECTION_KEYS.forEach(s => {
+  document.getElementById(s.id + '-meta'); // create reference nodes already exist in markup
+});
+/* Map canvas contexts to our ctxs object for easy use */
+ctxs.spectrum = ctxs.spectrum || (document.getElementById('spectrumCanvas').getContext('2d'));
+ctxs.spectrogram = ctxs.spectrogram || (document.getElementById('spectrogramCanvas').getContext('2d'));
+ctxs.waveform = ctxs.waveform || (document.getElementById('waveformCanvas').getContext('2d'));
+ctxs.octave = ctxs.octave || (document.getElementById('octaveCanvas').getContext('2d'));
+ctxs.rms = ctxs.rms || (document.getElementById('rmsCanvas')?.getContext('2d') || (function(){ // create tiny canvas node if not present
+  const node = document.createElement('canvas'); node.id = 'rmsCanvas'; document.getElementById('sec-rms').querySelector('.canvasWrap').appendChild(node); return node.getContext('2d');
+})());
+ctxs.peak = ctxs.peak || (document.getElementById('peakCanvas')?.getContext('2d') || (function(){ const node=document.createElement('canvas'); node.id='peakCanvas'; document.getElementById('sec-peak').querySelector('.canvasWrap').appendChild(node); return node.getContext('2d');})());
+ctxs.centroid = ctxs.centroid || (document.getElementById('centroidCanvas')?.getContext('2d') || (function(){ const node=document.createElement('canvas'); node.id='centroidCanvas'; document.getElementById('sec-centroid').querySelector('.canvasWrap').appendChild(node); return node.getContext('2d');})());
+ctxs.flux = ctxs.flux || (document.getElementById('fluxCanvas').getContext('2d'));
+ctxs.hist = ctxs.hist || (document.getElementById('histCanvas').getContext('2d'));
+ctxs.overall = ctxs.overall || (document.getElementById('overallCanvas')?.getContext('2d') || (function(){ const node=document.createElement('canvas'); node.id='overallCanvas'; document.getElementById('sec-overall').querySelector('.canvasWrap').appendChild(node); return node.getContext('2d');})());
+
+/* Create missing canvas spots for sections that had no dedicated canvas in original HTML */
+function ensureCanvases() {
+  // RMS / Peak / Centroid / Overall may not exist initially; create simple meta labels
+  ['rms','peak','centroid','overall'].forEach(id => {
+    const meta = document.getElementById(id + '-meta');
+    if (!meta) {
+      const header = document.getElementById('sec-' + id).querySelector('.sectionHeader');
+      const span = document.createElement('div'); span.id = id + '-meta'; span.className='small muted';
+      header.appendChild(span);
+    }
+  });
+}
+ensureCanvases();
+
+
+/* Small initialization to make sure canvases exist (some were inserted programmatically) */
+setTimeout(()=>{ window.dispatchEvent(new Event('resize')); }, 200);
+
+/* ------- Done: everything runs in client draw loop ------- */
+function drawZCR() {
+  const canvas = document.getElementById('zcrCanvas');
+  fitCanvas(canvas);
+  const ctx = ctxs.zcr;
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0,0,w,h);
+
+  const meta = document.getElementById('zcr-meta');
+  if (metricsHistory.length === 0) {
+    ctx.fillStyle = '#94a3b8';
+    ctx.fillText('No ZCR yet', 12, 28);
+    meta.textContent = '';
+    return;
+  }
+
+  const last = metricsHistory[metricsHistory.length - 1];
+  const zcrVal = last.zcr || 0;
+  const pct = clamp(zcrVal * 100, 0, 100);
+
+  ctx.fillStyle = '#fef3c7';
+  ctx.fillRect(10, h / 3, w - 20, h / 3);
+  ctx.fillStyle = '#f59e0b';
+  ctx.fillRect(10, h / 3, (w - 20) * (pct / 100), h / 3);
+
+  ctx.fillStyle = '#0b1220';
+  ctx.font = (14 * (window.devicePixelRatio || 1)) + 'px Inter';
+  ctx.fillText(`ZCR: ${zcrVal.toFixed(4)} (${pct.toFixed(1)}%)`, 16, h / 2 - 10);
+  meta.textContent = 'Zero Crossing Rate = rate of sign changes in PCM signal';
+}
+
+console.log('Visualizer ready — light theme, 8s history, per-section expand.');
+</script>
+</body>
+</html>
